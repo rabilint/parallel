@@ -80,39 +80,47 @@ void task_lu_decomposition(const Matrix1D& A, Matrix1D& L, Matrix1D& U, int n)
 }
 
 
+    // Swaps two rows in matrix A and updates the permutation vector P.
+    // This is used for partial pivoting to improve numerical stability.
     void swap_rows(Matrix1D& A,std::vector<int>& P,int n, int k, int max_row_index)
     {
-        if (k == max_row_index) return;
+        if (k == max_row_index) return; // No need to swap if the max element is already on the diagonal
+
+        // Parallelize the row swapping. Each thread swaps a portion of the row elements.
         #pragma omp for schedule(static)
         for (int j = 0; j < n; j++) {
             std::swap(A[k * n + j], A[max_row_index * n + j]);
         }
 
+        // Only one thread should update the permutation vector to avoid race conditions
         #pragma omp single
         std::swap(P[k], P[max_row_index]);
     }
 
-
+    // Performs LU decomposition on a vertical panel (block) of the matrix using the SAXPY approach.
+    // Also applies partial pivoting to find the max element in the current column.
     void SAXPY_parallel_lu_dec(Matrix1D& A, std::vector<int>& P,int n, int current_B, int k)
     {
-
         double global_max;
         int global_max_indx;
+
+        // Parallel region for processing the block column-by-column
         #pragma omp parallel
         for (int step = k; step < k + current_B; step++)
         {
-
-
+            // Reset the global maximum for the current column. Only one thread does this.
             #pragma omp single
             {
                 global_max = -1.0;
                 global_max_indx = step;
             }
 
-            // Локальні змінні для кожного потоку
+            // Локальні змінні для кожного потоку (Local variables for each thread)
             double local_max = -1.0;
             int local_max_indx = step;
 
+            // Distribute the search for the max element in the column across threads.
+            // 'nowait' allows threads to proceed to the critical section immediately without waiting for others.
             #pragma omp for nowait
             for (int i = step; i < n; i++)
             {
@@ -124,6 +132,7 @@ void task_lu_decomposition(const Matrix1D& A, Matrix1D& L, Matrix1D& U, int n)
                 }
             }
 
+        // Safely update the global maximum using a critical section
 #pragma omp critical
         {
             if (local_max > global_max)
@@ -133,15 +142,19 @@ void task_lu_decomposition(const Matrix1D& A, Matrix1D& L, Matrix1D& U, int n)
             }
         }
 
+        // Ensure all threads have finished finding the maximum before swapping rows
         #pragma omp barrier
+
+        // Swap the current row with the row having the maximum element (Pivoting)
         swap_rows(A,P,n,step,global_max_indx);
 
-
+        // Compute the multipliers for the current column of L
 #pragma omp for
         for (int j = step + 1; j < k + current_B; j++) {
             A[step * n + j] = A[step * n + j] / A[step * n + step];
         }
 
+        // Update the remaining submatrix in the panel (SAXPY operation: A = A - X * Y)
 #pragma omp for
         for (int i = step + 1; i < n; i++) {  // row
             for (int j = step + 1; j < k + current_B; j++) {             // col
@@ -152,45 +165,54 @@ void task_lu_decomposition(const Matrix1D& A, Matrix1D& L, Matrix1D& U, int n)
     }
 }
 
+// Performs Blocked LU Decomposition, which improves cache utilization for large matrices.
 void blocked_lu_dec(Matrix1D& A, Matrix1D& L, Matrix1D& U, std::vector<int>& P,int n)
 {
-    int B = 64;
+    int B = 64; // Розмір блоку (Block size. Chosen to fit well in CPU cache)
 
+    // Iterate over the matrix in blocks of size B
     for (int k = 0; k < n; k += B)
     {
+        // Handle edge cases where the remaining matrix size is less than the block size
         int current_B = std::min(B, n - k);
 
+        // 1. Panel Factorization: Decompose the current vertical block (panel)
         SAXPY_parallel_lu_dec(A,P,n, current_B, k);
 
+// Parallel region for updating the rest of the matrix
 #pragma omp parallel
         {
 
-#pragma omp for //U
-        for (int j = k + current_B; j < n; j += B) //початок чергового вертикального блоку в правій панелі (U12)
+// 2. Update the right panel (U elements)
+#pragma omp for // U
+        for (int j = k + current_B; j < n; j += B) // Start of next vertical block in right panel (U12)
         {
-            int j_limit = std::min(j + B, n); //щоб не вийти за межі матриці, якщо N не ділиться на B націло.
+            int j_limit = std::min(j + B, n); // щоб не вийти за межі матриці, якщо N не ділиться на B націло. (Prevent out-of-bounds access)
 
-            for (int jj = j; jj < j_limit; jj++)  // Внутрішній цикл по стовпцях
+            for (int jj = j; jj < j_limit; jj++)  // Внутрішній цикл по стовпцях (Inner loop over columns)
             {
-                for (int i = 0; i < current_B; i++) //Цикл по рядках
+                for (int i = 0; i < current_B; i++) // Цикл по рядках (Loop over rows within the current block)
                 {
-                    for (int m = 0; m < i; m++) //Обчислює суму добутків. Віднімає вплив усіх уже обчислених вище елементів (L) від поточного значення.
+                    for (int m = 0; m < i; m++) // Обчислює суму добутків. Віднімає вплив усіх уже обчислених вище елементів (L) від поточного значення. (Subtract already computed L elements)
                     {
-                        A[(k + i) * n + jj] = A[(k + i) * n + jj] - (A[(k + i) * n + (k + m)] * A[(k + m) * n + jj]);
+                        A[(k + i) * n + jj] = A[(k + i) * n + jj] - (A[(k + i) * n + (k + m)] * A[(k + m) * n + jj]); // SAXPY
                     }
+                    // Divide by the diagonal element to get the final U value
                     A[(k + i) * n + jj] /= A[(k + i) * n + (k + i)];
 
                 }
             }
         }
 
-
+// 3. Update the trailing submatrix (Schur complement)
+// 'collapse(2)' combines the two outer loops into one larger iteration space for better load balancing among threads
 #pragma omp for collapse(2)
         for (int i = k + current_B; i < n; i += B) {
             for (int j = k + current_B; j < n; j += B) {
                 int i_limit = std::min(i + B, n);
                 int j_limit = std::min(j + B, n);
 
+                // Perform block matrix multiplication to update the submatrix
                 for (int row = i; row < i_limit; row++)
                 {
                     for (int col = j; col < j_limit; col++)
@@ -210,21 +232,23 @@ void blocked_lu_dec(Matrix1D& A, Matrix1D& L, Matrix1D& U, std::vector<int>& P,i
     }
     }
 
+// 4. Extract L and U from the combined matrix A
+// In-place LU decomposition stores both L and U in A. This step separates them into distinct matrices.
 #pragma omp parallel for collapse(2)
     for (int row = 0; row < n; row++)
     {
         for (int col = 0; col < n; col++)
         {
-            if (row == col) //Діагональ
+            if (row == col) // Діагональ (Diagonal elements)
             {
-                U[row * n + col] = 1;
+                U[row * n + col] = 1; // U has 1s on the diagonal
                 L[row * n + col] = A[row * n + col];
             }
-            else if (row > col)
+            else if (row > col) // Lower triangular part (L)
             {
                 L[row * n + col] = A[row * n + col];
                 U[row * n + col] = 0.0;
-            }else
+            }else // Upper triangular part (U)
             {
                 U[row * n + col] = A[row * n + col];
                 L[row * n + col] = 0.0;
@@ -352,26 +376,21 @@ void reset_matrices(Matrix1D& L, Matrix1D& U)
 bool verify_b_SAXPY(const Matrix1D& A_orig, const std::vector<int>& P,
                   const Matrix1D& L, const Matrix1D& U, int n)
 {
-    const double epsilon = 1e-5; // Трохи збільшимо допуск для double
+    const double epsilon = 1e-5;
     bool is_correct = true;
 
 #pragma omp parallel for shared(is_correct) schedule(dynamic)
     for (int i = 0; i < n; i++) {
-        // Ранній вихід, якщо помилку вже знайдено іншим потоком
         if (!is_correct) continue;
 
         for (int k = 0; k < n; k++) {
             double sum = 0.0;
 
-            // Оптимізований цикл: j іде лише там, де обидва елементи (L та U) не нульові
-            // Для LU це j від 0 до n, але реально L[i][j]=0 при j>i, U[j][k]=0 при j>k
             int limit = std::min(i, k);
             for (int j = 0; j <= limit; j++) {
                 sum += L[i * n + j] * U[j * n + k];
             }
 
-            // Якщо j == k, а k < i, ми додали L[i][k]*U[k][k].
-            // Оскільки U[k][k] завжди 1.0 у твоїй схемі Краута.
 
             if (std::abs(sum - A_orig[P[i] * n + k]) > epsilon) {
 #pragma omp critical
@@ -394,7 +413,7 @@ bool verify_b_SAXPY(const Matrix1D& A_orig, const std::vector<int>& P,
 int main() {
 
 
-    std::vector<int> sizes = {10000};
+    std::vector<int> sizes = {1000};
 
 
 
@@ -473,7 +492,7 @@ int main() {
         // print_matrix(U, n);
 
 
-        printf("Beginning of blocked LU Dec");
+        printf("\nBeginning of blocked LU Dec\n");
         reset_matrices(L, U);
         start_time = omp_get_wtime();
         blocked_lu_dec(A,L,U,P,n);
