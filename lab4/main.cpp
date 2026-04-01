@@ -258,6 +258,7 @@ void blocked_lu_dec(Matrix1D& A, Matrix1D& L, Matrix1D& U, std::vector<int>& P,i
 }
 
 
+
 void parallel_lu_decomposition(const Matrix1D& A, Matrix1D& L, Matrix1D& U, int n) {
     for (int i = 0; i < n; i++) {
         U[i * n + i] = 1.0;
