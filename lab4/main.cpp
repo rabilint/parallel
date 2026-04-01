@@ -1,10 +1,34 @@
 #include <iostream>
 #include <vector>
 #include <iomanip>
+#include <fstream>
 #include <omp.h>
 #include <random>
+#include <sys/resource.h>
+#include <algorithm>
+
+#include <linux/perf_event.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <cstring>
 
 using Matrix1D = std::vector<double>;
+
+void print_resource_metrics(const std::string& label, const struct rusage& start, const struct rusage& end) {
+    double user_time = (end.ru_utime.tv_sec - start.ru_utime.tv_sec) +
+                       (end.ru_utime.tv_usec - start.ru_utime.tv_usec) / 1000000.0;
+    double sys_time  = (end.ru_stime.tv_sec - start.ru_stime.tv_sec) +
+                       (end.ru_stime.tv_usec - start.ru_stime.tv_usec) / 1000000.0;
+
+    // В OS Linux ru_maxrss повертається у кілобайтах
+    long peak_ram_mb = end.ru_maxrss / 1024;
+
+    std::cout << std::left << std::setw(20) << label
+              << " | CPU User: " << std::fixed << std::setprecision(4) << user_time << " s"
+              << " | CPU Sys: " << sys_time << " s"
+              << " | Peak RAM: " << peak_ram_mb << " MB\n";
+}
 
 void consecutive_lu_decomposition(const Matrix1D& A, Matrix1D& L, Matrix1D& U, int n)
 {
@@ -411,146 +435,358 @@ bool verify_b_SAXPY(const Matrix1D& A_orig, const std::vector<int>& P,
 }
 
 
-int main() {
 
+class OmpCacheMissCounter {
+    std::vector<int> fds;
+public:
+    void start() {
+        int num_threads = omp_get_max_threads();
+        fds.assign(num_threads, -1);
 
-    std::vector<int> sizes = {1000};
-
-
-
-    for (int size : sizes)
-    {
-
-        printf("\nsize of square matrix: %d \n", size);
-        int n = size;
-        Matrix1D A(n * n), L(n * n, 0.0), U(n * n, 0.0), COPY(n*n);
-        std::vector<int> P (n);
-        for (int i = 0; i < n; i++)
+#pragma omp parallel
         {
-            P[i] = i;
+            int tid = omp_get_thread_num();
+            struct perf_event_attr pe;
+            std::memset(&pe, 0, sizeof(struct perf_event_attr));
+            pe.type = PERF_TYPE_HARDWARE;
+            pe.size = sizeof(struct perf_event_attr);
+            pe.config = PERF_COUNT_HW_CACHE_MISSES;
+            pe.disabled = 1;
+            pe.exclude_kernel = 1;
+            pe.exclude_hv = 1;
+
+            // Відкриття лічильника для поточного потоку
+            fds[tid] = syscall(__NR_perf_event_open, &pe, 0, -1, -1, 0);
+            if (fds[tid] != -1) {
+                ioctl(fds[tid], PERF_EVENT_IOC_RESET, 0);
+                ioctl(fds[tid], PERF_EVENT_IOC_ENABLE, 0);
+            }
         }
+    }
+
+    long long stop_and_read() {
+        long long total_misses = 0;
+
+#pragma omp parallel reduction(+:total_misses)
+        {
+            int tid = omp_get_thread_num();
+            if (fds[tid] != -1) {
+                long long count = 0;
+                ioctl(fds[tid], PERF_EVENT_IOC_DISABLE, 0);
+                if (read(fds[tid], &count, sizeof(long long)) > 0) {
+                    total_misses += count;
+                }
+                close(fds[tid]);
+            }
+        }
+        fds.clear();
+        return total_misses;
+    }
+};
 
 
-        unsigned int base_seed = std::random_device{}();
 
+int main() {
+    OmpCacheMissCounter cache_counter;
+    // Відкриваємо файл для запису (overwrite)
+    std::ofstream outfile("benchmark_results.txt");
+    if (!outfile.is_open()) {
+        std::cerr << "Error opening file!" << std::endl;
+        return 1;
+    }
 
+    #pragma omp parallel
+    { /* Warm-up threads */ }
 
+    std::vector<int> sizes = {100, 500, 1000, 2500, 5000};
+    const int NUM_RUNS = 5;
+
+    for (int size : sizes) {
+        int n = size;
+        outfile << "======================================================\n";
+        outfile << "SIZE: " << n << "x" << n << "\n";
+        outfile << "======================================================\n";
+        std::cout << "Processing size: " << n << "..." << std::endl; // Статус у консоль
+
+        Matrix1D A_orig(n * n);
+        std::vector<int> P_orig(n);
+        for (int i = 0; i < n; i++) P_orig[i] = i;
+
+        // Генерація даних (один раз для обох алгоритмів)
+        unsigned int base_seed = 42;
         #pragma omp parallel
         {
             std::mt19937 rng(base_seed + omp_get_thread_num());
-            std::uniform_int_distribution<int> distribution(-10, 10 );
+            std::uniform_int_distribution<int> distribution(-10, 10);
             #pragma omp for
-            for (int i = 0; i < n * n; i++) A[i] = distribution(rng);
+            for (int i = 0; i < n * n; i++) A_orig[i] = distribution(rng);
         }
 
+        double blocked_min_wtime = 0;
+        double parallel_min_wtime = 0;
 
-        // print_matrix(A,n);
-
-
-        double start_time;
-        double end_time;
-        COPY = A;
-
-        // printf("Beginning of parallel LU decomposition\n");
-        // reset_matrices(L, U);
-        // start_time = omp_get_wtime();
-        // parallel_lu_decomposition(A, L, U, n);
-        // end_time = omp_get_wtime();
-        // printf("Time: %f\n",    end_time - start_time);
-        // if (verify_lu(A,L,U,n))
-        // {
-        //     printf("Matrix Verification OK\n");
-        // }
-        // else
-        // {
-        //     printf("Matrix Verification FAILED\n");
-        // }
-
-        // std::cout << "Matrix L:\n";
-        // print_matrix(L, n);
-        //
-        // std::cout << "Matrix U:\n";
-        // print_matrix(U, n);
-
-        // printf("Beginning of task parallel LU decomposition\n");
-        // reset_matrices(L, U);
-        // start_time = omp_get_wtime();
-        // task_lu_decomposition(A,L,U,n);
-        // end_time = omp_get_wtime();
-        // printf("Time: %f\n",    end_time - start_time);
-        // if (verify_lu(A,L,U,n))
-        // {
-        //     printf("Matrix Verification OK\n");
-        // }
-        // else
-        // {
-        //     printf("Matrix Verification FAILED\n");
-        // }
-        // std::cout << "Matrix L:\n";
-        // print_matrix(L, n);
-        //
-        // std::cout << "Matrix U:\n";
-        // print_matrix(U, n);
-
-
-        printf("\nBeginning of blocked LU Dec\n");
-        reset_matrices(L, U);
-        start_time = omp_get_wtime();
-        blocked_lu_dec(A,L,U,P,n);
-        end_time = omp_get_wtime();
-        printf("Time: %f\n",    end_time - start_time);
-        if (verify_b_SAXPY(COPY, P, L, U, n))
+        // --- Блок 1: Blocked LU ---
         {
-            printf("Matrix Verification OK\n");
-        }else
-        {
-            printf("Matrix Verification FAILED\n");
+            double total_cpu_user = 0, total_cpu_sys = 0;
+            std::vector<double> w_times;
+            long peak_rss = 0;
+            bool is_valid = false;
+            long long total_cache_misses = 0;
+
+            for (int r = 0; r < NUM_RUNS; r++) {
+                Matrix1D A_work = A_orig;
+                std::vector<int> P_work = P_orig;
+                Matrix1D L(n * n, 0.0), U(n * n, 0.0);
+
+                struct rusage r_start, r_end;
+                getrusage(RUSAGE_SELF, &r_start);
+                cache_counter.start();
+                double start_wtime = omp_get_wtime();
+
+                blocked_lu_dec(A_work, L, U, P_work, n);
+
+                long long run_misses = cache_counter.stop_and_read();
+                total_cache_misses += run_misses;
+                if (r == 0) is_valid = verify_b_SAXPY(A_orig, P_work, L, U, n);
+
+                double end_wtime = omp_get_wtime();
+                getrusage(RUSAGE_SELF, &r_end);
+
+                w_times.push_back(end_wtime - start_wtime);
+                total_cpu_user += (r_end.ru_utime.tv_sec - r_start.ru_utime.tv_sec) + (r_end.ru_utime.tv_usec - r_start.ru_utime.tv_usec) / 1000000.0;
+                total_cpu_sys += (r_end.ru_stime.tv_sec - r_start.ru_stime.tv_sec) + (r_end.ru_stime.tv_usec - r_start.ru_stime.tv_usec) / 1000000.0;
+                peak_rss = std::max(peak_rss, r_end.ru_maxrss);
+
+            }
+            double min_t = *std::min_element(w_times.begin(), w_times.end());
+            double max_t = *std::max_element(w_times.begin(), w_times.end());
+            double avg_t = std::accumulate(w_times.begin(), w_times.end(), 0.0) / NUM_RUNS;
+
+            outfile << "Block LU dec statistic:\n";
+            outfile << " Min: " << std::fixed << std::setprecision(5) << min_t << " s\n";
+            outfile << " Max: " << max_t << " s\n";
+            outfile << " Avg: " << avg_t << " s\n";
+            outfile << " Valid: " << (is_valid ? "OK" : "FAIL") << "\n\n";
+
+            outfile << "---------------------------\n\n";
+
+            blocked_min_wtime = *std::min_element(w_times.begin(), w_times.end());
+            outfile << "Block res usage:\n";
+            outfile << "  Min Wall Time: " << blocked_min_wtime << " s\n";
+            outfile << "  Avg CPU User:  " << total_cpu_user / NUM_RUNS << " s\n";
+            outfile << "  Avg CPU Sys:   " << total_cpu_sys / NUM_RUNS << " s\n";
+            outfile << "  Peak RAM:      " << peak_rss / 1024 << " MB\n\n";
+            outfile << "  Avg Cache Miss:  " << total_cache_misses / NUM_RUNS << " misses\n\n";
+
+            outfile << "\n\n######################################################\n\n";
         }
 
-        // printf("Beginning of SAXPY_parallel_lu_dec\n");
-        // reset_matrices(L, U);
-        // start_time = omp_get_wtime();
-        // SAXPY_parallel_lu_dec(COPY,L,U,P,n);
-        // end_time = omp_get_wtime();
-        // printf("Time: %f\n",    end_time - start_time);
-        // if (verify_SAXPY(A,P,L,U,n))
-        // {
-        //     printf("Matrix Verification OK\n");
-        // }
-        // else
-        // {
-        //     printf("Matrix Verification FAILED\n");
-        // }
+        // --- Блок 2: Parallel LU ---
+        {
+            long long total_cache_misses = 0;
+            double total_cpu_user = 0, total_cpu_sys = 0;
+            std::vector<double> w_times;
+            long peak_rss = 0;
+            bool is_valid = false;
 
-        // std::cout << "Matrix L:\n";
-        // print_matrix(L, n);
-        // std::cout << "Matrix U:\n";
-        // print_matrix(U, n);
+            for (int r = 0; r < NUM_RUNS; r++) {
+                Matrix1D L(n * n, 0.0), U(n * n, 0.0);
 
+                struct rusage r_start, r_end;
+                getrusage(RUSAGE_SELF, &r_start);
+                double start_wtime = omp_get_wtime();
+                cache_counter.start();
 
+                parallel_lu_decomposition(A_orig, L, U, n);
+                long long run_misses = cache_counter.stop_and_read();
+                total_cache_misses += run_misses;
 
+                double end_wtime = omp_get_wtime();
 
-        //
-        // printf("Beginning of consecutive LU decomposition\n");
-        // reset_matrices(L, U);
-        // start_time = omp_get_wtime();
-        // consecutive_lu_decomposition(A,L,U,n);
-        // end_time = omp_get_wtime();
-        // printf("Time: %f\n",    end_time - start_time);
-        // if (verify_lu(A,L,U,n))
-        // {
-        //     printf("Matrix Verification OK\n");
-        // }
-        // else
-        // {
-        //     printf("Matrix Verification FAILED\n");
-        // }
-        // std::cout << "Matrix L:\n";
-        // print_matrix(L, n);
-        //
-        // std::cout << "Matrix U:\n";
-        // print_matrix(U, n);
+                getrusage(RUSAGE_SELF, &r_end);
 
+                w_times.push_back(end_wtime - start_wtime);
+                if (r == 0) is_valid = verify_lu(A_orig, L, U, n);
+                total_cpu_user += (r_end.ru_utime.tv_sec - r_start.ru_utime.tv_sec) + (r_end.ru_utime.tv_usec - r_start.ru_utime.tv_usec) / 1000000.0;
+                total_cpu_sys += (r_end.ru_stime.tv_sec - r_start.ru_stime.tv_sec) + (r_end.ru_stime.tv_usec - r_start.ru_stime.tv_usec) / 1000000.0;
+                peak_rss = std::max(peak_rss, r_end.ru_maxrss);
+
+            }
+
+            double min_t = *std::min_element(w_times.begin(), w_times.end());
+            double max_t = *std::max_element(w_times.begin(), w_times.end());
+            double avg_t = std::accumulate(w_times.begin(), w_times.end(), 0.0) / NUM_RUNS;
+
+            outfile << "Parallel statistic:\n";
+            outfile << "  Min: " << std::fixed << std::setprecision(5) << min_t << " s\n";
+            outfile << "  Max: " << max_t << " s\n";
+            outfile << "  Avg: " << avg_t << " s\n";
+            outfile << "  Valid: " << (is_valid ? "OK" : "FAIL") << "\n\n";
+
+            outfile << "---------------------------\n\n";
+
+            parallel_min_wtime = *std::min_element(w_times.begin(), w_times.end());
+            outfile << "Parallel res usage:\n";
+            outfile << "  Min Wall Time: " << parallel_min_wtime << " s\n";
+            outfile << "  Avg CPU User:  " << total_cpu_user / NUM_RUNS << " s\n";
+            outfile << "  Avg CPU Sys:   " << total_cpu_sys / NUM_RUNS << " s\n";
+            outfile << "  Peak RAM:      " << peak_rss / 1024 << " MB\n\n";
+            outfile << "  Avg Cache Miss:  " << total_cache_misses / NUM_RUNS << " misses\n\n";
+        }
+
+        outfile << "Efficiency Gain (Parallel/Block): " << (parallel_min_wtime / blocked_min_wtime) << "x\n\n";
     }
+
+    outfile.close();
+    std::cout << "Done! Results saved to benchmark_results.txt" << std::endl;
     return 0;
 }
+
+
+
+//
+// int main() {        Мертвий код. Залишений для того-щоб швидко використовувати вже прописані запуски.
+//
+//     #pragma omp parallel
+//     { } // Прогрів потоків
+//
+//     std::vector<int> sizes = {100,500,1000,2500};
+//     const int NUM_RUNS = 5; // Кількість запусків для статистичної вибірки
+//
+//
+//     for (int size : sizes)
+//     {
+//
+//         printf("\nsize of square matrix: %d \n", size);
+//         int n = size;
+//         Matrix1D A(n * n), L(n * n, 0.0), U(n * n, 0.0), COPY(n*n);
+//         std::vector<int> P (n);
+//         for (int i = 0; i < n; i++)
+//         {
+//             P[i] = i;
+//         }
+//
+//
+//         unsigned int base_seed = std::random_device{}();
+//
+//
+//
+//         #pragma omp parallel
+//         {
+//             std::mt19937 rng(base_seed + omp_get_thread_num());
+//             std::uniform_int_distribution<int> distribution(-10, 10 );
+//             #pragma omp for
+//             for (int i = 0; i < n * n; i++) A[i] = distribution(rng);
+//         }
+//
+//
+//         // print_matrix(A,n);
+//
+//
+//         double start_time;
+//         double end_time;
+//         COPY = A;
+//
+//         // printf("Beginning of parallel LU decomposition\n");
+//         // reset_matrices(L, U);
+//         // start_time = omp_get_wtime();
+//         // parallel_lu_decomposition(A, L, U, n);
+//         // end_time = omp_get_wtime();
+//         // printf("Time: %f\n",    end_time - start_time);
+//         // if (verify_lu(A,L,U,n))
+//         // {
+//         //     printf("Matrix Verification OK\n");
+//         // }
+//         // else
+//         // {
+//         //     printf("Matrix Verification FAILED\n");
+//         // }
+//
+//         // std::cout << "Matrix L:\n";
+//         // print_matrix(L, n);
+//         //
+//         // std::cout << "Matrix U:\n";
+//         // print_matrix(U, n);
+//
+//         // printf("Beginning of task parallel LU decomposition\n");
+//         // reset_matrices(L, U);
+//         // start_time = omp_get_wtime();
+//         // task_lu_decomposition(A,L,U,n);
+//         // end_time = omp_get_wtime();
+//         // printf("Time: %f\n",    end_time - start_time);
+//         // if (verify_lu(A,L,U,n))
+//         // {
+//         //     printf("Matrix Verification OK\n");
+//         // }
+//         // else
+//         // {
+//         //     printf("Matrix Verification FAILED\n");
+//         // }
+//         // std::cout << "Matrix L:\n";
+//         // print_matrix(L, n);
+//         //
+//         // std::cout << "Matrix U:\n";
+//         // print_matrix(U, n);
+//
+//
+//         printf("\nBeginning of blocked LU Dec\n");
+//         reset_matrices(L, U);
+//         start_time = omp_get_wtime();
+//         blocked_lu_dec(A,L,U,P,n);
+//         end_time = omp_get_wtime();
+//         printf("Time: %f\n",    end_time - start_time);
+//         if (verify_b_SAXPY(COPY, P, L, U, n))
+//         {
+//             printf("Matrix Verification OK\n");
+//         }else
+//         {
+//             printf("Matrix Verification FAILED\n");
+//         }
+//
+//         // printf("Beginning of SAXPY_parallel_lu_dec\n");
+//         // reset_matrices(L, U);
+//         // start_time = omp_get_wtime();
+//         // SAXPY_parallel_lu_dec(COPY,L,U,P,n);
+//         // end_time = omp_get_wtime();
+//         // printf("Time: %f\n",    end_time - start_time);
+//         // if (verify_SAXPY(A,P,L,U,n))
+//         // {
+//         //     printf("Matrix Verification OK\n");
+//         // }
+//         // else
+//         // {
+//         //     printf("Matrix Verification FAILED\n");
+//         // }
+//
+//         // std::cout << "Matrix L:\n";
+//         // print_matrix(L, n);
+//         // std::cout << "Matrix U:\n";
+//         // print_matrix(U, n);
+//
+//
+//
+//
+//         //
+//         // printf("Beginning of consecutive LU decomposition\n");
+//         // reset_matrices(L, U);
+//         // start_time = omp_get_wtime();
+//         // consecutive_lu_decomposition(A,L,U,n);
+//         // end_time = omp_get_wtime();
+//         // printf("Time: %f\n",    end_time - start_time);
+//         // if (verify_lu(A,L,U,n))
+//         // {
+//         //     printf("Matrix Verification OK\n");
+//         // }
+//         // else
+//         // {
+//         //     printf("Matrix Verification FAILED\n");
+//         // }
+//         // std::cout << "Matrix L:\n";
+//         // print_matrix(L, n);
+//         //
+//         // std::cout << "Matrix U:\n";
+//         // print_matrix(U, n);
+//
+//     }
+//     return 0;
+// }
