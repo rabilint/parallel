@@ -6,6 +6,7 @@
 #include <random>
 #include <sys/resource.h>
 #include <algorithm>
+#include <lapacke.h>
 
 #include <linux/perf_event.h>
 #include <sys/syscall.h>
@@ -56,6 +57,16 @@ void consecutive_lu_decomposition(const Matrix1D& A, Matrix1D& L, Matrix1D& U, i
         }
     }
 
+}
+
+void lapack_lu_decomposition(Matrix1D& A, int n,std::vector<int>& ipiv) {
+    int info = LAPACKE_dgetrf(LAPACK_ROW_MAJOR, n, n, A.data(), n, ipiv.data());
+
+    if (info > 0) {
+        std::cerr << "Помилка: Матриця є сингулярною.\n";
+    } else if (info < 0) {
+        std::cerr << "Помилка: Неправильний аргумент на позиції " << -info << ".\n";
+    }
 }
 
 
@@ -495,6 +506,7 @@ int main() {
         return 1;
     }
 
+
     #pragma omp parallel
     { /* Warm-up threads */ }
 
@@ -510,20 +522,23 @@ int main() {
 
         Matrix1D A_orig(n * n);
         std::vector<int> P_orig(n);
+        std::vector<int> ipiv(n);
+
         for (int i = 0; i < n; i++) P_orig[i] = i;
 
-        // Генерація даних (один раз для обох алгоритмів)
+
         unsigned int base_seed = 42;
         #pragma omp parallel
         {
-            std::mt19937 rng(base_seed + omp_get_thread_num());
+            std::mt19937 rng(base_seed);
             std::uniform_int_distribution<int> distribution(-10, 10);
-            #pragma omp for
             for (int i = 0; i < n * n; i++) A_orig[i] = distribution(rng);
         }
 
         double blocked_min_wtime = 0;
         double parallel_min_wtime = 0;
+        double LAPACK_min_wtime = 0;
+
 
         // --- Блок 1: Blocked LU ---
         {
@@ -632,10 +647,60 @@ int main() {
             outfile << "  Avg CPU Sys:   " << total_cpu_sys / NUM_RUNS << " s\n";
             outfile << "  Peak RAM:      " << peak_rss / 1024 << " MB\n\n";
             outfile << "  Avg Cache Miss:  " << total_cache_misses / NUM_RUNS << " misses\n\n";
+
+            outfile << "\n\n######################################################\n\n";
         }
 
-        outfile << "Efficiency Gain (Parallel/Block): " << (parallel_min_wtime / blocked_min_wtime) << "x\n\n";
+        // --- Блок 3: LAPACK LU ---
+        {
+            double total_cpu_user = 0, total_cpu_sys = 0;
+            std::vector<double> w_times;
+            long peak_rss = 0;
+
+            for (int r = 0; r < NUM_RUNS; r++) {
+                Matrix1D A_work = A_orig; // Робоча копія для перезапису
+                std::vector<int> ipiv_work = ipiv;
+                struct rusage r_start, r_end;
+                getrusage(RUSAGE_SELF, &r_start);
+                double start_wtime = omp_get_wtime();
+
+                lapack_lu_decomposition(A_work, n,ipiv_work);
+
+                double end_wtime = omp_get_wtime();
+
+                getrusage(RUSAGE_SELF, &r_end);
+
+                w_times.push_back(end_wtime - start_wtime);
+                total_cpu_user += (r_end.ru_utime.tv_sec - r_start.ru_utime.tv_sec) + (r_end.ru_utime.tv_usec - r_start.ru_utime.tv_usec) / 1000000.0;
+                total_cpu_sys += (r_end.ru_stime.tv_sec - r_start.ru_stime.tv_sec) + (r_end.ru_stime.tv_usec - r_start.ru_stime.tv_usec) / 1000000.0;
+                peak_rss = std::max(peak_rss, r_end.ru_maxrss);
+            }
+
+            double min_t = *std::min_element(w_times.begin(), w_times.end());
+            double max_t = *std::max_element(w_times.begin(), w_times.end());
+            double avg_t = std::accumulate(w_times.begin(), w_times.end(), 0.0) / NUM_RUNS;
+
+            outfile << "LAPACK LU statistic:\n";
+            outfile << "  Min: " << std::fixed << std::setprecision(5) << min_t << " s\n";
+            outfile << "  Max: " << max_t << " s\n";
+            outfile << "  Avg: " << avg_t << " s\n";
+
+            outfile << "---------------------------\n\n";
+
+            LAPACK_min_wtime = *std::min_element(w_times.begin(), w_times.end());
+            outfile << "LAPACK LU res usage:\n";
+            outfile << "  Min Wall Time: " << LAPACK_min_wtime << " s\n";
+            outfile << "  Avg CPU User:  " << total_cpu_user / NUM_RUNS << " s\n";
+            outfile << "  Avg CPU Sys:   " << total_cpu_sys / NUM_RUNS << " s\n";
+            outfile << "  Peak RAM:      " << peak_rss / 1024 << " MB\n\n";
+            outfile << "  Avg Cache Miss: N/A (unsupported threading model)\n\n";
+        }
+
+        // outfile << "Efficiency Gain (Parallel / Block): " << ( parallel_min_wtime / blocked_min_wtime) << "x\n";
+        // outfile << "Efficiency Gain (Block / LAPACK): " << (blocked_min_wtime / LAPACK_min_wtime) << "x\n";
+        // outfile << "Efficiency Gain (Parallel / LAPACK): " << (parallel_min_wtime / LAPACK_min_wtime) << "x\n\n";
     }
+
 
     outfile.close();
     std::cout << "Done! Results saved to benchmark_results.txt" << std::endl;
