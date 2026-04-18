@@ -1,0 +1,7 @@
+Sequential Analysis - Status 500
+Unique IPs: 500523
+1. 86.19.241.73 : 2 hits
+2. 188.158.175.193 : 2 hits
+3. 171.243.6.118 : 2 hits
+4. 100.244.108.183 : 2 hits
+5. 142.45.70.198 : 2 hits

@@ -14,10 +14,9 @@ int main(int argc, char* argv[])
 
     std::string message = "innit.";
 
-    // Визначаємо колір: 0 для обраних, MPI_UNDEFINED для інших
+
     int color = (rank == 0 || rank == 4) ? 0 : MPI_UNDEFINED;
 
-    // Створення нового комунікатора
     MPI_Comm_split(MPI_COMM_WORLD, color, rank, &new_comm);
 
     int my_new_rank = -1, new_size = -1;
@@ -34,24 +33,21 @@ int main(int argc, char* argv[])
             msg_size = static_cast<int>(message.size());
         }
 
-        // Розсилка розміру повідомлення
         MPI_Bcast(&msg_size, 1, MPI_INT, 0, new_comm);
 
-        // Резервування місця на процесах-отримувачах
         if (my_new_rank != 0) {
             message.resize(msg_size);
         }
 
-        // Розсилка самого тексту (використовуємо &message[0] для сумісності)
         MPI_Bcast(&message[0], msg_size, MPI_CHAR, 0, new_comm);
     }
 
-    // Синхронізований вивід
+
     MPI_Barrier(MPI_COMM_WORLD);
     std::cout << "<<Rank " << rank << "/" << np << " | New Rank: "
               << my_new_rank << "/" << new_size << " | Msg: " << message << ">>" << std::endl;
 
-    // Звільняємо лише те, що реально створили
+
     if (new_comm != MPI_COMM_NULL)
     {
         MPI_Comm_free(&new_comm);
